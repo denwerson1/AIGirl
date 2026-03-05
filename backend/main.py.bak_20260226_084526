@@ -1,0 +1,585 @@
+﻿# -*- coding: utf-8 -*-
+"""
+AIGirl Backend (local/offline)
+Patch 001: character traits + thoughts + autotune policy
+
+This backend intentionally does not call any external cloud APIs.
+It only works with local services and MS SQL.
+"""
+from __future__ import annotations
+
+import json
+import os
+import logging
+import traceback
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import pyodbc
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# Logging (write to C:\AIGirl\logs and also stdout)
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
+LOG_DIR = os.path.join(ROOT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "backend_api.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("aigirl")
+
+
+APP_VERSION = "0.2.3-patch001-hf4"
+
+app = FastAPI(title="AIGirl Backend", version=APP_VERSION)
+
+
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return v
+
+
+def get_cnx(autocommit: bool = False) -> pyodbc.Connection:
+    """
+    Create a DB connection.
+
+    Behavior:
+      1) If DB_USER/DB_PASSWORD are provided → try SQL Authentication.
+      2) If SQL Authentication fails (common when SQL Server is still in Windows-only mode)
+         → fall back to Integrated Security.
+      3) If DB_USER/DB_PASSWORD are not provided → Integrated Security.
+    """
+    driver = _env("DB_DRIVER", "ODBC Driver 17 for SQL Server")
+    server = _env("DB_SERVER")
+    database = _env("DB_NAME", "AIGirl")
+    user = _env("DB_USER")
+    pwd = _env("DB_PASSWORD")
+
+    if not server:
+        raise RuntimeError("DB_SERVER is not set in backend/.env")
+
+    cs_integrated = (
+        f"Driver={{{driver}}};"
+        f"Server={server};"
+        f"Database={database};"
+        "Trusted_Connection=yes;"
+        "TrustServerCertificate=yes;"
+    )
+
+    if user and pwd:
+        cs_sql = (
+            f"Driver={{{driver}}};"
+            f"Server={server};"
+            f"Database={database};"
+            f"UID={user};"
+            f"PWD={pwd};"
+            "TrustServerCertificate=yes;"
+        )
+        try:
+            return pyodbc.connect(cs_sql, autocommit=autocommit)
+        except pyodbc.Error:
+            # Fall back to Integrated Security
+            return pyodbc.connect(cs_integrated, autocommit=autocommit)
+
+    return pyodbc.connect(cs_integrated, autocommit=autocommit)
+def fetch_all(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    try:
+        with get_cnx(autocommit=True) as cn:
+            cur = cn.cursor()
+            cur.execute(sql, params)
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except pyodbc.Error as e:
+        logger.exception("DB error in fetch_all")
+        raise HTTPException(status_code=500, detail=f"DB error: {str(e)}")
+    except Exception as e:
+        logger.exception("Unhandled error in fetch_all")
+        raise
+
+
+def fetch_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    rows = fetch_all(sql, params)
+    return rows[0] if rows else None
+
+
+def _character_row(character_key: str) -> Dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT TOP (1) Id, [Key], DisplayName, Surname, [Name], DistinctiveMarksJson, NotesRu
+        FROM dbo.Characters
+        WHERE [Key] = ?
+        """,
+        (character_key,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Character not found: {character_key}")
+    return row
+
+
+def _ensure_trait_key(parameter_key: str) -> None:
+    if not (
+        parameter_key.startswith("trait.")
+        or parameter_key.startswith("state.")
+        or parameter_key.startswith("voice.")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only trait./state./voice. keys are allowed in this endpoint.",
+        )
+
+
+def _get_param_def(parameter_key: str) -> Dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT TOP(1)
+          [Key], NameRu, GroupRu,
+          MinValue, MaxValue, DefaultValue, HintRu,
+          ISNULL(ValueType, N'slider_int') AS ValueType,
+          UnitRu, StepValue
+        FROM dbo.ParameterDefinitions
+        WHERE [Key] = ?
+        """,
+        (parameter_key,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Unknown parameter: {parameter_key}")
+    return row
+
+
+def _choose_thought(
+    character_key: str, parameter_key: str, value_int: int, delta_int: Optional[int]
+) -> str:
+    """
+    Pick a thought template based on value 0..100 and append trend line based on last delta.
+    Priority: character-specific template > default (CharacterKey='default').
+    """
+    # Character-specific first
+    row = fetch_one(
+        """
+        SELECT TOP(1) TextRu, TrendUpTextRu, TrendDownTextRu
+        FROM dbo.ParameterThoughtTemplates
+        WHERE ParameterKey = ?
+          AND CharacterKey = ?
+          AND ? BETWEEN BinMin AND BinMax
+        """,
+        (parameter_key, character_key, value_int),
+    )
+    if not row:
+        row = fetch_one(
+            """
+            SELECT TOP(1) TextRu, TrendUpTextRu, TrendDownTextRu
+            FROM dbo.ParameterThoughtTemplates
+            WHERE ParameterKey = ?
+              AND CharacterKey = 'default'
+              AND ? BETWEEN BinMin AND BinMax
+            """,
+            (parameter_key, value_int),
+        )
+
+    if row:
+        text = row.get("TextRu") or ""
+        up = row.get("TrendUpTextRu") or ""
+        down = row.get("TrendDownTextRu") or ""
+    else:
+        # Fallback (should rarely happen if patch seeded templates)
+        text = "Я воспринимаю это спокойно и стараюсь держать баланс."
+        up = "Я замечаю, что это качество во мне усиливается."
+        down = "Похоже, я стала более сдержанной в этой стороне."
+
+    if delta_int is None or delta_int == 0:
+        return text
+    if delta_int > 0 and up:
+        return f"{text} {up}"
+    if delta_int < 0 and down:
+        return f"{text} {down}"
+    return text
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "version": APP_VERSION, "ts": datetime.utcnow().isoformat() + "Z"}
+
+
+
+@app.get("/debug/dbtest")
+def debug_dbtest() -> Dict[str, Any]:
+    """
+    Quick DB smoke test (local only). Returns SQL version, current user and counts.
+    """
+    try:
+        info = fetch_one("SELECT @@VERSION as SqlVersion, SYSTEM_USER as SystemUser, DB_NAME() as DbName")
+        cnt_chars = fetch_one("SELECT COUNT(1) as Count FROM dbo.Characters")
+        cnt_params = fetch_one("SELECT COUNT(1) as Count FROM dbo.ParameterDefinitions")
+        return {
+            "ok": True,
+            "db": info,
+            "counts": {
+                "characters": cnt_chars["Count"] if cnt_chars else None,
+                "parameter_definitions": cnt_params["Count"] if cnt_params else None,
+            },
+            "log_file": LOG_FILE,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("debug_dbtest failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/log_tail")
+def debug_log_tail(lines: int = Query(default=200, ge=1, le=2000)) -> Dict[str, Any]:
+    """
+    Returns last N lines of backend log (for troubleshooting).
+    """
+    try:
+        if not os.path.exists(LOG_FILE):
+            return {"ok": True, "log_file": LOG_FILE, "lines": []}
+        with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+        return {"ok": True, "log_file": LOG_FILE, "lines": all_lines[-lines:]}
+    except Exception as e:
+        logger.exception("debug_log_tail failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/characters")
+def characters() -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT [Key], DisplayName, Surname, [Name], DistinctiveMarksJson, NotesRu
+        FROM dbo.Characters
+        ORDER BY Id
+        """
+    )
+    # normalize json columns
+    for r in rows:
+        dj = r.get("DistinctiveMarksJson")
+        if isinstance(dj, str) and dj.strip():
+            try:
+                r["DistinctiveMarks"] = json.loads(dj)
+            except Exception:
+                r["DistinctiveMarks"] = None
+        else:
+            r["DistinctiveMarks"] = None
+    return rows
+
+
+@app.get("/parameters")
+def parameters(
+    prefix: Optional[str] = Query(default=None, description="Optional key prefix filter, e.g. trait. or state."),
+) -> List[Dict[str, Any]]:
+    if prefix:
+        rows = fetch_all(
+            """
+            SELECT
+              [Key], NameRu, GroupRu,
+              MinValue, MaxValue, DefaultValue, HintRu,
+              ISNULL(ValueType, N'slider_int') AS ValueType,
+              UnitRu, StepValue
+            FROM dbo.ParameterDefinitions
+            WHERE [Key] LIKE ?
+            ORDER BY GroupRu, NameRu
+            """,
+            (prefix + "%",),
+        )
+    else:
+        rows = fetch_all(
+            """
+            SELECT
+              [Key], NameRu, GroupRu,
+              MinValue, MaxValue, DefaultValue, HintRu,
+              ISNULL(ValueType, N'slider_int') AS ValueType,
+              UnitRu, StepValue
+            FROM dbo.ParameterDefinitions
+            ORDER BY GroupRu, NameRu
+            """
+        )
+    return rows
+
+
+@app.get("/characters/{character_key}/traits")
+def character_traits(
+    character_key: str,
+    include_state: bool = True,
+    include_voice: bool = True,
+) -> Dict[str, Any]:
+    c = _character_row(character_key)
+    char_id = int(c["Id"])
+
+    where = ["p.[Key] LIKE N'trait.%'"]
+    if include_state:
+        where.append("p.[Key] LIKE N'state.%'")
+    if include_voice:
+        where.append("p.[Key] LIKE N'voice.%'")
+    where_sql = " OR ".join(where)
+
+    defs = fetch_all(
+        f"""
+        SELECT
+          p.[Key] AS ParameterKey,
+          p.NameRu, p.GroupRu,
+          p.MinValue, p.MaxValue, p.DefaultValue, p.HintRu,
+          ISNULL(p.ValueType, N'slider_int') AS ValueType,
+          p.UnitRu, p.StepValue,
+          COALESCE(v.ValueInt, p.DefaultValue) AS ValueInt
+        FROM dbo.ParameterDefinitions p
+        LEFT JOIN dbo.CharacterParameterValues v
+          ON v.ParameterKey = p.[Key]
+         AND v.CharacterId = ?
+        WHERE ({where_sql})
+        ORDER BY p.GroupRu, p.NameRu
+        """,
+        (char_id,),
+    )
+
+    # Fetch last delta per parameter in one query
+    deltas = fetch_all(
+        """
+        WITH h AS (
+          SELECT CharacterId, ParameterKey, DeltaInt,
+                 ROW_NUMBER() OVER(PARTITION BY CharacterId, ParameterKey ORDER BY CreatedAt DESC, Id DESC) AS rn
+          FROM dbo.CharacterParameterHistory
+          WHERE CharacterId = ?
+        )
+        SELECT ParameterKey, DeltaInt
+        FROM h
+        WHERE rn = 1
+        """,
+        (char_id,),
+    )
+    delta_map = {d["ParameterKey"]: d.get("DeltaInt") for d in deltas}
+
+    items = []
+    for d in defs:
+        v = int(d.get("ValueInt") or d.get("DefaultValue") or 0)
+        delta = delta_map.get(d["ParameterKey"])
+        thought = _choose_thought(character_key, d["ParameterKey"], v, delta if delta is not None else 0)
+        items.append(
+            {
+                "key": d["ParameterKey"],
+                "nameRu": d["NameRu"],
+                "groupRu": d["GroupRu"],
+                "min": int(d["MinValue"]),
+                "max": int(d["MaxValue"]),
+                "default": int(d["DefaultValue"]),
+                "hintRu": d.get("HintRu") or "",
+                "valueType": d.get("ValueType") or "slider_int",
+                "unitRu": d.get("UnitRu"),
+                "step": int(d.get("StepValue") or 1),
+                "valueInt": v,
+                "trendDelta": int(delta or 0),
+                "thoughtRu": thought,
+            }
+        )
+
+    return {"character": {"key": c["Key"], "displayName": c["DisplayName"]}, "items": items}
+
+
+class TraitSetRequest(BaseModel):
+    parameter_key: str = Field(..., description="Key of parameter, must start with trait./state./voice.")
+    value_int: int = Field(..., description="New integer value, must be within [min,max] from ParameterDefinitions.")
+    reason_ru: Optional[str] = Field(default=None, description="Optional reason for audit/history.")
+    source: str = Field(default="admin", description="Source marker: admin/autotune/system.")
+
+
+@app.post("/characters/{character_key}/traits/set")
+def set_character_trait(character_key: str, req: TraitSetRequest) -> Dict[str, Any]:
+    _ensure_trait_key(req.parameter_key)
+
+    c = _character_row(character_key)
+    char_id = int(c["Id"])
+
+    p = _get_param_def(req.parameter_key)
+    minv = int(p["MinValue"])
+    maxv = int(p["MaxValue"])
+    if req.value_int < minv or req.value_int > maxv:
+        raise HTTPException(status_code=400, detail=f"value_int must be in [{minv},{maxv}] for {req.parameter_key}")
+
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+
+        # old value (fallback to default)
+        cur.execute(
+            "SELECT ValueInt FROM dbo.CharacterParameterValues WHERE CharacterId=? AND ParameterKey=?",
+            (char_id, req.parameter_key),
+        )
+        row = cur.fetchone()
+        old_val = row[0] if row and row[0] is not None else int(p["DefaultValue"])
+
+        # upsert
+        if row:
+            cur.execute(
+                """
+                UPDATE dbo.CharacterParameterValues
+                SET ValueInt=?, UpdatedAt=sysdatetime()
+                WHERE CharacterId=? AND ParameterKey=?
+                """,
+                (req.value_int, char_id, req.parameter_key),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO dbo.CharacterParameterValues(CharacterId, ParameterKey, ValueInt)
+                VALUES(?, ?, ?)
+                """,
+                (char_id, req.parameter_key, req.value_int),
+            )
+
+        delta = int(req.value_int) - int(old_val)
+        cur.execute(
+            """
+            INSERT INTO dbo.CharacterParameterHistory(CharacterId, ParameterKey, OldValueInt, NewValueInt, DeltaInt, ReasonRu, Source)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                char_id,
+                req.parameter_key,
+                int(old_val),
+                int(req.value_int),
+                int(delta),
+                req.reason_ru,
+                req.source,
+            ),
+        )
+
+        cn.commit()
+
+    # return updated view item
+    thought = _choose_thought(character_key, req.parameter_key, int(req.value_int), delta)
+    return {
+        "characterKey": character_key,
+        "parameterKey": req.parameter_key,
+        "oldValueInt": int(old_val),
+        "newValueInt": int(req.value_int),
+        "deltaInt": int(delta),
+        "thoughtRu": thought,
+    }
+
+
+@app.get("/characters/{character_key}/traits/history")
+def trait_history(
+    character_key: str,
+    parameter_key: str = Query(...),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> Dict[str, Any]:
+    _ensure_trait_key(parameter_key)
+
+    c = _character_row(character_key)
+    char_id = int(c["Id"])
+
+    rows = fetch_all(
+        """
+        SELECT TOP (?)
+          Id, ParameterKey, OldValueInt, NewValueInt, DeltaInt, ReasonRu, Source, CreatedAt
+        FROM dbo.CharacterParameterHistory
+        WHERE CharacterId=? AND ParameterKey=?
+        ORDER BY CreatedAt DESC, Id DESC
+        """,
+        (limit, char_id, parameter_key),
+    )
+    return {"characterKey": character_key, "parameterKey": parameter_key, "items": rows}
+
+
+@app.get("/thought_templates/{parameter_key}")
+def get_thought_templates(
+    parameter_key: str,
+    character_key: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    # parameter_key may be for any parameter, but usually trait/state/voice
+    rows = fetch_all(
+        """
+        SELECT ParameterKey, CharacterKey, BinMin, BinMax, TextRu, TrendUpTextRu, TrendDownTextRu, UpdatedAt
+        FROM dbo.ParameterThoughtTemplates
+        WHERE ParameterKey = ?
+          AND (? IS NULL OR CharacterKey IN (?, 'default'))
+        ORDER BY
+          CASE WHEN CharacterKey = 'default' THEN 0 ELSE 1 END,
+          CharacterKey, BinMin
+        """,
+        (parameter_key, character_key, character_key),
+    )
+    return {"parameterKey": parameter_key, "items": rows}
+
+
+class ThoughtTemplateUpsert(BaseModel):
+    character_key: Optional[str] = Field(default=None, description="Use null/empty to mean default templates (CharacterKey=\'default\').")
+    bin_min: int = Field(..., ge=0, le=100)
+    bin_max: int = Field(..., ge=0, le=100)
+    text_ru: str = Field(..., min_length=1, max_length=1024)
+    trend_up_text_ru: Optional[str] = Field(default=None, max_length=512)
+    trend_down_text_ru: Optional[str] = Field(default=None, max_length=512)
+
+
+@app.post("/thought_templates/{parameter_key}/upsert")
+def upsert_thought_template(parameter_key: str, req: ThoughtTemplateUpsert) -> Dict[str, Any]:
+    if req.bin_min > req.bin_max:
+        raise HTTPException(status_code=400, detail="bin_min must be <= bin_max")
+
+    ck = (req.character_key or '').strip().lower()
+    if not ck:
+        ck = 'default'
+
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        # upsert by PK
+        cur.execute(
+            """
+            IF EXISTS (
+              SELECT 1 FROM dbo.ParameterThoughtTemplates
+              WHERE ParameterKey = ?
+                AND CharacterKey = ?
+                AND BinMin = ? AND BinMax = ?
+            )
+            BEGIN
+              UPDATE dbo.ParameterThoughtTemplates
+              SET TextRu = ?,
+                  TrendUpTextRu = ?,
+                  TrendDownTextRu = ?,
+                  UpdatedAt = sysdatetime()
+              WHERE ParameterKey = ?
+                AND CharacterKey = ?
+                AND BinMin = ? AND BinMax = ?;
+            END
+            ELSE
+            BEGIN
+              INSERT INTO dbo.ParameterThoughtTemplates(ParameterKey, CharacterKey, BinMin, BinMax, TextRu, TrendUpTextRu, TrendDownTextRu)
+              VALUES(?, ?, ?, ?, ?, ?, ?);
+            END
+            """,
+            (
+                parameter_key,
+                ck,
+                int(req.bin_min),
+                int(req.bin_max),
+                req.text_ru,
+                req.trend_up_text_ru,
+                req.trend_down_text_ru,
+                parameter_key,
+                ck,
+                int(req.bin_min),
+                int(req.bin_max),
+                parameter_key,
+                ck,
+                int(req.bin_min),
+                int(req.bin_max),
+                req.text_ru,
+                req.trend_up_text_ru,
+                req.trend_down_text_ru,
+            ),
+        )
+        cn.commit()
+
+    return {"ok": True, "parameterKey": parameter_key, "characterKey": ck, "binMin": req.bin_min, "binMax": req.bin_max}

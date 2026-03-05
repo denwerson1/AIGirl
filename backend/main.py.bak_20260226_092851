@@ -1,0 +1,872 @@
+﻿# -*- coding: utf-8 -*-
+"""
+AIGirl Backend (local/offline)
+
+Patch 002: Autotune engine (learn from interaction events) + event log.
+- Stores every interaction/event in MS SQL.
+- Applies gradual parameter drift according to ParameterAutoTunePolicy.
+- Keeps everything offline (no cloud calls).
+
+This file is deployed to both backend/main.py and backend/app.py.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+import threading
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import pyodbc
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+
+APP_VERSION = "0.3.0-patch002"
+DEFAULT_CHARKEY = "default"
+
+# Autotune background worker (optional)
+# -----------------------------
+# Logging
+# -----------------------------
+ROOT_DEFAULT = r"C:\AIGirl"
+LOG_DIR = os.path.join(ROOT_DEFAULT, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "backend_api.log")
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("aigirl-backend")
+# -----------------------------
+# Environment
+# -----------------------------
+load_dotenv()
+def _env(key: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(key)
+    if v is None or v == "":
+        return default
+    return v
+
+# Autotune background worker (optional)
+AUTOTUNE_BACKGROUND = (_env("AUTOTUNE_BACKGROUND", "0") == "1")
+AUTOTUNE_INTERVAL_SEC = int(float(_env("AUTOTUNE_INTERVAL_SEC", "30") or "30"))
+AUTOTUNE_MAX_EVENTS = int(float(_env("AUTOTUNE_MAX_EVENTS", "50") or "50"))
+
+def get_cnx(autocommit: bool = False) -> pyodbc.Connection:
+    """
+    Create a DB connection.
+    Behavior:
+      1) If DB_USER/DB_PASSWORD are provided → try SQL Authentication.
+      2) If SQL Authentication fails → fall back to Integrated Security.
+      3) If DB_USER/DB_PASSWORD are not provided → Integrated Security.
+    """
+    driver = _env("DB_DRIVER", "ODBC Driver 17 for SQL Server")
+    server = _env("DB_SERVER")
+    database = _env("DB_NAME", "AIGirl")
+    user = _env("DB_USER")
+    pwd = _env("DB_PASSWORD")
+    if not server:
+        raise RuntimeError("DB_SERVER is not set in backend/.env")
+    cs_integrated = (
+        f"Driver={{{driver}}};"
+        f"Server={server};"
+        f"Database={database};"
+        "Trusted_Connection=yes;"
+        "TrustServerCertificate=yes;"
+    )
+    if user and pwd:
+        cs_sql = (
+            f"Driver={{{driver}}};"
+            f"Server={server};"
+            f"Database={database};"
+            f"UID={user};"
+            f"PWD={pwd};"
+            "TrustServerCertificate=yes;"
+        )
+        try:
+            return pyodbc.connect(cs_sql, autocommit=autocommit)
+        except pyodbc.Error as e:
+            logger.warning("SQL auth failed, falling back to Integrated Security: %s", str(e))
+            return pyodbc.connect(cs_integrated, autocommit=autocommit)
+    return pyodbc.connect(cs_integrated, autocommit=autocommit)
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="AIGirl Backend", version=APP_VERSION)
+@app.middleware("http")
+async def force_utf8_json_charset(request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if ct.startswith("application/json") and "charset=" not in ct.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
+# -----------------------------
+# Models
+# -----------------------------
+class CharacterOut(BaseModel):
+    Key: str
+    DisplayName: str
+    Surname: str
+    Name: str
+    DistinctiveMarksJson: Optional[str] = None
+    NotesRu: Optional[str] = None
+    DistinctiveMarks: Optional[Dict[str, Any]] = None
+class ParameterOut(BaseModel):
+    key: str
+    nameRu: str
+    groupRu: str
+    minValue: int
+    maxValue: int
+    defaultValue: int
+    hintRu: Optional[str] = None
+    valueInt: int
+    unitRu: Optional[str] = None
+    stepValue: Optional[int] = None
+    thoughtRu: Optional[str] = None
+    trendDelta: int = 0
+    valueType: Optional[str] = None
+class TraitSetIn(BaseModel):
+    parameter_key: str = Field(..., min_length=1)
+    value_int: int
+    reason_ru: str = "Ручная настройка"
+    source: str = "admin"
+class ThoughtTemplateUpsertIn(BaseModel):
+    character_key: Optional[str] = None  # None means default
+    bin_min: int
+    bin_max: int
+    text_ru: str
+    trend_up_text_ru: Optional[str] = None
+    trend_down_text_ru: Optional[str] = None
+class EventIn(BaseModel):
+    platform: str = "admin"            # telegram/instagram/tiktok/admin
+    channel: str = "dm"                # dm/comment/public/voice/video
+    conversation_key: Optional[str] = None
+    character_key: str
+    event_type: str                    # inbound_message/outbound_message/reaction/admin_score/post_metrics/...
+    lang: Optional[str] = None
+    text: Optional[str] = None
+    sentiment: Optional[float] = None  # -1..1 (optional)
+    engagement: Optional[float] = None # 0..1 (optional)
+    admin_score: Optional[int] = None  # 1..5 (optional)
+    payload: Optional[Dict[str, Any]] = None
+class ProcessResult(BaseModel):
+    ok: bool
+    processed_events: int
+    applied_changes: int
+    dry_run: bool
+    notes: Optional[str] = None
+# -----------------------------
+# Helpers
+# -----------------------------
+def _parse_json_safe(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+def _get_character_id(cursor, character_key: str) -> int:
+    cursor.execute("SELECT TOP 1 Id FROM dbo.Characters WHERE [Key]=?", character_key)
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Character '{character_key}' not found")
+    return int(row[0])
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+def _normalize_signal(name: str, v: Optional[float]) -> float:
+    if v is None:
+        return 0.0
+    try:
+        x = float(v)
+    except Exception:
+        return 0.0
+    if name == "admin_score":
+        # 1..5 => -1..1 (center 3)
+        x = _clamp_int(int(round(x)), 1, 5)
+        return (x - 3.0) / 2.0
+    if name == "engagement":
+        # 0..1 => -1..1
+        if x < 0.0: x = 0.0
+        if x > 1.0: x = 1.0
+        return x * 2.0 - 1.0
+    if name == "sentiment":
+        # -1..1 as is
+        if x < -1.0: x = -1.0
+        if x > 1.0: x = 1.0
+        return x
+    # default
+    if x < -1.0: x = -1.0
+    if x > 1.0: x = 1.0
+    return x
+def _get_last_delta(cursor, character_id: int, parameter_key: str) -> int:
+    cursor.execute(
+        "SELECT TOP 1 COALESCE(DeltaInt,0) FROM dbo.CharacterParameterHistory "
+        "WHERE CharacterId=? AND ParameterKey=? ORDER BY CreatedAt DESC, Id DESC",
+        character_id, parameter_key
+    )
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
+def _get_thought(cursor, parameter_key: str, character_key: str, value_int: int, trend_delta: int) -> Optional[str]:
+    # find template: character-specific first, else default
+    # NOTE: CharacterKey is NOT NULL in current schema (default='default')
+    cursor.execute(
+        "SELECT TOP 1 TextRu, TrendUpTextRu, TrendDownTextRu "
+        "FROM dbo.ParameterThoughtTemplates "
+        "WHERE ParameterKey=? AND CharacterKey=? AND BinMin<=? AND BinMax>=? "
+        "ORDER BY BinMin ASC",
+        parameter_key, character_key, value_int, value_int
+    )
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute(
+            "SELECT TOP 1 TextRu, TrendUpTextRu, TrendDownTextRu "
+            "FROM dbo.ParameterThoughtTemplates "
+            "WHERE ParameterKey=? AND CharacterKey=? AND BinMin<=? AND BinMax>=? "
+            "ORDER BY BinMin ASC",
+            parameter_key, DEFAULT_CHARKEY, value_int, value_int
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    text = row[0]
+    up = row[1] if len(row) > 1 else None
+    down = row[2] if len(row) > 2 else None
+    if trend_delta > 0 and up:
+        return f"{text} {up}"
+    if trend_delta < 0 and down:
+        return f"{text} {down}"
+    return text
+def _ensure_value_row(cursor, character_id: int, parameter_key: str) -> int:
+    cursor.execute(
+        "SELECT ValueInt FROM dbo.CharacterParameterValues WHERE CharacterId=? AND ParameterKey=?",
+        character_id, parameter_key
+    )
+    row = cursor.fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+    # fallback to default from definitions
+    cursor.execute("SELECT TOP 1 DefaultValue FROM dbo.ParameterDefinitions WHERE [Key]=?", parameter_key)
+    d = cursor.fetchone()
+    default_value = int(d[0]) if d else 50
+    # upsert
+    cursor.execute(
+        "MERGE dbo.CharacterParameterValues AS tgt "
+        "USING (SELECT ? AS CharacterId, ? AS ParameterKey) AS src "
+        "ON (tgt.CharacterId=src.CharacterId AND tgt.ParameterKey=src.ParameterKey) "
+        "WHEN MATCHED THEN UPDATE SET ValueInt=?, UpdatedAt=sysdatetime() "
+        "WHEN NOT MATCHED THEN INSERT(CharacterId,ParameterKey,ValueInt,UpdatedAt) VALUES(?,?,?,sysdatetime());",
+        character_id, parameter_key, default_value, character_id, parameter_key, default_value
+    )
+    return default_value
+def _set_value(cursor, character_id: int, parameter_key: str, new_value: int, reason_ru: str, source: str) -> Tuple[int, int]:
+    old_value = _ensure_value_row(cursor, character_id, parameter_key)
+    cursor.execute(
+        "SELECT TOP 1 MinAllowed, MaxAllowed FROM dbo.ParameterAutoTunePolicy WHERE ParameterKey=?",
+        parameter_key
+    )
+    pol = cursor.fetchone()
+    if pol:
+        min_allowed, max_allowed = int(pol[0]), int(pol[1])
+    else:
+        cursor.execute("SELECT TOP 1 MinValue, MaxValue FROM dbo.ParameterDefinitions WHERE [Key]=?", parameter_key)
+        d = cursor.fetchone()
+        min_allowed, max_allowed = (int(d[0]), int(d[1])) if d else (0, 100)
+    clamped = _clamp_int(int(new_value), min_allowed, max_allowed)
+    delta = clamped - old_value
+    cursor.execute(
+        "UPDATE dbo.CharacterParameterValues SET ValueInt=?, UpdatedAt=sysdatetime() "
+        "WHERE CharacterId=? AND ParameterKey=?",
+        clamped, character_id, parameter_key
+    )
+    cursor.execute(
+        "INSERT INTO dbo.CharacterParameterHistory(CharacterId,ParameterKey,OldValueInt,NewValueInt,DeltaInt,ReasonRu,Source) "
+        "VALUES(?,?,?,?,?,?,?)",
+        character_id, parameter_key, old_value, clamped, delta, reason_ru, source
+    )
+    return old_value, clamped
+# -----------------------------
+# Autotune engine
+# -----------------------------
+def _get_policy(cursor, parameter_key: str) -> Tuple[bool, int, int, float, Dict[str, Any]]:
+    cursor.execute(
+        "SELECT Enabled, MinAllowed, MaxAllowed, LearnRate, COALESCE(SignalsJson,N'{}') "
+        "FROM dbo.ParameterAutoTunePolicy WHERE ParameterKey=?",
+        parameter_key
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False, 0, 100, 0.0, {}
+    enabled = bool(row[0])
+    min_allowed = int(row[1])
+    max_allowed = int(row[2])
+    learn_rate = float(row[3])
+    sig = _parse_json_safe(row[4]) or {}
+    return enabled, min_allowed, max_allowed, learn_rate, sig
+def _get_accumulator(cursor, character_id: int, parameter_key: str) -> float:
+    cursor.execute(
+        "SELECT Residual FROM dbo.CharacterParameterAccumulators WHERE CharacterId=? AND ParameterKey=?",
+        character_id, parameter_key
+    )
+    row = cursor.fetchone()
+    return float(row[0]) if row else 0.0
+def _set_accumulator(cursor, character_id: int, parameter_key: str, residual: float) -> None:
+    cursor.execute(
+        "MERGE dbo.CharacterParameterAccumulators AS tgt "
+        "USING (SELECT ? AS CharacterId, ? AS ParameterKey) AS src "
+        "ON (tgt.CharacterId=src.CharacterId AND tgt.ParameterKey=src.ParameterKey) "
+        "WHEN MATCHED THEN UPDATE SET Residual=? "
+        "WHEN NOT MATCHED THEN INSERT(CharacterId,ParameterKey,Residual) VALUES(?,?,?);",
+        character_id, parameter_key, float(residual), character_id, parameter_key, float(residual)
+    )
+def _apply_autotune_delta(
+    cursor,
+    character_id: int,
+    parameter_key: str,
+    delta_float: float,
+    reason_ru: str,
+    source: str,
+    dry_run: bool
+) -> int:
+    """
+    Apply float delta using residual accumulator.
+    Returns applied integer delta (could be 0).
+    """
+    enabled, min_allowed, max_allowed, _, _ = _get_policy(cursor, parameter_key)
+    if not enabled:
+        return 0
+    residual = _get_accumulator(cursor, character_id, parameter_key)
+    residual_new = residual + float(delta_float)
+    # convert residual to integer step (towards zero remainder)
+    delta_int = 0
+    if residual_new >= 1.0:
+        delta_int = int(residual_new // 1.0)
+        residual_new = residual_new - float(delta_int)
+    elif residual_new <= -1.0:
+        delta_int = -int((-residual_new) // 1.0)
+        residual_new = residual_new - float(delta_int)
+    if dry_run:
+        return delta_int
+    # store residual (even if 0 change)
+    _set_accumulator(cursor, character_id, parameter_key, residual_new)
+    if delta_int == 0:
+        return 0
+    old_value = _ensure_value_row(cursor, character_id, parameter_key)
+    new_value = _clamp_int(old_value + delta_int, min_allowed, max_allowed)
+    applied = new_value - old_value
+    if applied == 0:
+        return 0
+    cursor.execute(
+        "UPDATE dbo.CharacterParameterValues SET ValueInt=?, UpdatedAt=sysdatetime() "
+        "WHERE CharacterId=? AND ParameterKey=?",
+        new_value, character_id, parameter_key
+    )
+    cursor.execute(
+        "INSERT INTO dbo.CharacterParameterHistory(CharacterId,ParameterKey,OldValueInt,NewValueInt,DeltaInt,ReasonRu,Source) "
+        "VALUES(?,?,?,?,?,?,?)",
+        character_id, parameter_key, old_value, new_value, applied, reason_ru, source
+    )
+    return applied
+def _compute_delta_from_signals(learn_rate: float, weights: Dict[str, Any], signals: Dict[str, float]) -> float:
+    # weights example: {"admin_score": 0.7, "engagement": 0.3}
+    s = 0.0
+    for k, w in weights.items():
+        if k.startswith("__"):
+            continue
+        try:
+            wf = float(w)
+        except Exception:
+            continue
+        s += wf * float(signals.get(k, 0.0))
+    return float(learn_rate) * s
+def _event_category(event_type: str) -> str:
+    t = (event_type or "").lower()
+    if t.startswith("admin"):
+        return "admin"
+    if "metric" in t or "reaction" in t or "like" in t or "view" in t:
+        return "public"
+    if "inbound" in t or "comment" in t or "dm_in" in t or "message_in" in t:
+        return "inbound"
+    return "generic"
+def _candidate_keys_for_category(cat: str) -> List[str]:
+    if cat == "inbound":
+        return [
+            "state.mood", "state.energy", "state.stress", "state.calm",
+            "state.curiosity", "state.irritation", "state.playfulness",
+            "state.social_battery", "state.loneliness",
+            "trait.social.empathy", "trait.social.boundaries"
+        ]
+    if cat == "public":
+        return [
+            "state.satisfaction", "state.confidence", "state.inspiration",
+            "trait.core.self_confidence", "trait.core.optimism",
+            "voice.confidence", "voice.warmth",
+            "trait.speech.storytelling", "trait.speech.humor"
+        ]
+    if cat == "admin":
+        return [
+            "trait.core.self_confidence", "trait.core.orderliness", "trait.core.optimism", "trait.core.anxiety",
+            "trait.core.emotional_stability",
+            "trait.social.empathy", "trait.social.tact", "trait.social.boundaries", "trait.social.supportiveness",
+            "trait.speech.storytelling", "trait.speech.humor", "trait.speech.verbosity", "trait.speech.confidence_tone",
+            "voice.confidence", "voice.warmth", "voice.emotion_variation",
+            "state.confidence", "state.satisfaction"
+        ]
+    return [
+        "state.mood", "state.energy", "state.stress", "state.confidence", "state.satisfaction"
+    ]
+def process_events(limit: int = 100, dry_run: bool = False, character_key: Optional[str] = None) -> Tuple[int, int]:
+    processed = 0
+    applied = 0
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        if character_key:
+            cur.execute(
+                "SELECT TOP (?) Id, CharacterKey, EventType, Lang, Sentiment, EngagementScore, AdminScore, PayloadJson "
+                "FROM dbo.InteractionEvents WHERE Processed=0 AND CharacterKey=? ORDER BY CreatedAt ASC, Id ASC",
+                int(limit), character_key
+            )
+        else:
+            cur.execute(
+                "SELECT TOP (?) Id, CharacterKey, EventType, Lang, Sentiment, EngagementScore, AdminScore, PayloadJson "
+                "FROM dbo.InteractionEvents WHERE Processed=0 ORDER BY CreatedAt ASC, Id ASC",
+                int(limit)
+            )
+        rows = cur.fetchall()
+        for row in rows:
+            event_id = int(row[0])
+            ch_key = str(row[1])
+            ev_type = str(row[2] or "")
+            lang = row[3]
+            sentiment = row[4]
+            engagement = row[5]
+            admin_score = row[6]
+            payload_json = row[7]
+            cat = _event_category(ev_type)
+            candidate_keys = _candidate_keys_for_category(cat)
+            # build normalized signals
+            signals = {
+                "sentiment": _normalize_signal("sentiment", sentiment),
+                "engagement": _normalize_signal("engagement", engagement),
+                "admin_score": _normalize_signal("admin_score", admin_score),
+            }
+            # lookup character id
+            try:
+                char_id = _get_character_id(cur, ch_key)
+            except HTTPException:
+                # mark processed with note
+                if not dry_run:
+                    cur.execute(
+                        "UPDATE dbo.InteractionEvents SET Processed=1, ProcessedAt=sysdatetime(), ProcessingNotes=? WHERE Id=?",
+                        "character_not_found", event_id
+                    )
+                processed += 1
+                continue
+            # Apply each candidate key if policy enabled
+            change_count = 0
+            for pkey in candidate_keys:
+                enabled, _, _, learn_rate, weights = _get_policy(cur, pkey)
+                if not enabled:
+                    continue
+                if not weights or weights == {}:
+                    # empty mapping means "do not autotune" (explicit)
+                    continue
+                delta_float = _compute_delta_from_signals(learn_rate, weights, signals)
+                if abs(delta_float) < 1e-9:
+                    continue
+                reason = f"autotune({cat}): {ev_type} signals={json.dumps(signals, ensure_ascii=False)}"
+                d_int = _apply_autotune_delta(cur, char_id, pkey, delta_float, reason, "autotune", dry_run=dry_run)
+                if d_int != 0:
+                    applied += 1
+                    change_count += 1
+            if not dry_run:
+                cur.execute(
+                    "UPDATE dbo.InteractionEvents SET Processed=1, ProcessedAt=sysdatetime(), ProcessingNotes=? WHERE Id=?",
+                    f"cat={cat}; changes={change_count}", event_id
+                )
+            processed += 1
+        if not dry_run:
+            cn.commit()
+        else:
+            cn.rollback()
+    return processed, applied
+def _log_autotune_run(processed_events: int, applied_changes: int, dry_run: bool, notes: str = "") -> None:
+    try:
+        with get_cnx(autocommit=False) as cn:
+            cur = cn.cursor()
+            cur.execute(
+                "INSERT INTO dbo.AutotuneRuns(ProcessedEvents,AppliedChanges,DryRun,Notes,CompletedAt) "
+                "VALUES(?,?,?,?,sysdatetime())",
+                int(processed_events), int(applied_changes), 1 if dry_run else 0, notes
+            )
+            cn.commit()
+    except Exception as e:
+        logger.warning("Failed to log autotune run: %s", str(e))
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "version": APP_VERSION, "ts": datetime.utcnow().isoformat() + "Z"}
+@app.get("/debug/dbtest")
+def debug_dbtest() -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        cur.execute("SELECT @@VERSION")
+        ver = cur.fetchone()[0]
+        return {"ok": True, "db": {"SqlVersion": ver}}
+@app.get("/debug/log_tail")
+def debug_log_tail(lines: int = 200) -> Dict[str, Any]:
+    try:
+        n = int(lines)
+    except Exception:
+        n = 200
+    n = 50 if n < 50 else (2000 if n > 2000 else n)
+    if not os.path.exists(LOG_FILE):
+        return {"ok": True, "log_file": LOG_FILE, "lines": []}
+    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read().splitlines()
+    return {"ok": True, "log_file": LOG_FILE, "lines": data[-n:]}
+@app.get("/characters")
+def get_characters() -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        cur.execute("SELECT [Key], DisplayName, Surname, [Name], DistinctiveMarksJson, NotesRu FROM dbo.Characters ORDER BY Id ASC")
+        res = []
+        for r in cur.fetchall():
+            dmj = r[4]
+            dmd = _parse_json_safe(dmj)
+            res.append({
+                "Key": r[0],
+                "DisplayName": r[1],
+                "Surname": r[2],
+                "Name": r[3],
+                "DistinctiveMarksJson": dmj,
+                "NotesRu": r[5],
+                "DistinctiveMarks": dmd
+            })
+        return {"value": res, "Count": len(res)}
+@app.get("/parameters")
+def get_parameters(prefix: str = Query("", description="Filter by prefix, e.g. trait.")) -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        if prefix:
+            cur.execute(
+                "SELECT [Key], NameRu, GroupRu, MinValue, MaxValue, DefaultValue, HintRu, ValueType, UnitRu, StepValue "
+                "FROM dbo.ParameterDefinitions WHERE [Key] LIKE ? ORDER BY GroupRu, NameRu",
+                prefix + "%"
+            )
+        else:
+            cur.execute(
+                "SELECT [Key], NameRu, GroupRu, MinValue, MaxValue, DefaultValue, HintRu, ValueType, UnitRu, StepValue "
+                "FROM dbo.ParameterDefinitions ORDER BY GroupRu, NameRu"
+            )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "key": r[0], "nameRu": r[1], "groupRu": r[2],
+                "minValue": int(r[3]), "maxValue": int(r[4]),
+                "defaultValue": int(r[5]) if r[5] is not None else 50,
+                "hintRu": r[6], "valueType": r[7], "unitRu": r[8], "stepValue": r[9]
+            })
+        return {"value": out, "Count": len(out)}
+@app.get("/characters/{character_key}/traits")
+def get_character_traits(character_key: str) -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        char_id = _get_character_id(cur, character_key)
+        cur.execute(
+            "SELECT [Key], NameRu, GroupRu, MinValue, MaxValue, DefaultValue, HintRu, ValueType, UnitRu, StepValue "
+            "FROM dbo.ParameterDefinitions "
+            "WHERE [Key] LIKE N'trait.%' OR [Key] LIKE N'state.%' OR [Key] LIKE N'voice.%' "
+            "ORDER BY GroupRu, NameRu"
+        )
+        defs = cur.fetchall()
+        out = []
+        for d in defs:
+            pkey = d[0]
+            value = _ensure_value_row(cur, char_id, pkey)
+            trend = _get_last_delta(cur, char_id, pkey)
+            thought = _get_thought(cur, pkey, character_key, value, trend)
+            out.append({
+                "key": pkey,
+                "nameRu": d[1],
+                "groupRu": d[2],
+                "minValue": int(d[3]),
+                "maxValue": int(d[4]),
+                "defaultValue": int(d[5]) if d[5] is not None else 50,
+                "hintRu": d[6],
+                "valueType": d[7],
+                "unitRu": d[8],
+                "stepValue": d[9],
+                "valueInt": int(value),
+                "thoughtRu": thought,
+                "trendDelta": int(trend),
+            })
+        return {"value": out, "Count": len(out)}
+@app.post("/characters/{character_key}/traits/set")
+def set_character_trait(character_key: str, payload: TraitSetIn) -> Dict[str, Any]:
+    if payload.value_int < -100000 or payload.value_int > 100000:
+        raise HTTPException(status_code=400, detail="value_int out of allowed range")
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        char_id = _get_character_id(cur, character_key)
+        # manual set: reset accumulator to 0 to avoid surprise overshoot
+        cur.execute(
+            "DELETE FROM dbo.CharacterParameterAccumulators WHERE CharacterId=? AND ParameterKey=?",
+            char_id, payload.parameter_key
+        )
+        old_v, new_v = _set_value(
+            cur,
+            char_id,
+            payload.parameter_key,
+            int(payload.value_int),
+            payload.reason_ru,
+            payload.source
+        )
+        cn.commit()
+    return {"ok": True, "parameter_key": payload.parameter_key, "old": old_v, "new": new_v}
+@app.get("/characters/{character_key}/traits/history")
+def get_trait_history(character_key: str, parameter_key: str, limit: int = 50) -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        char_id = _get_character_id(cur, character_key)
+        lim = int(limit)
+        if lim < 1: lim = 1
+        if lim > 500: lim = 500
+        cur.execute(
+            "SELECT TOP (?) OldValueInt, NewValueInt, DeltaInt, ReasonRu, Source, CreatedAt "
+            "FROM dbo.CharacterParameterHistory "
+            "WHERE CharacterId=? AND ParameterKey=? "
+            "ORDER BY CreatedAt DESC, Id DESC",
+            lim, char_id, parameter_key
+        )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "old": r[0],
+                "new": r[1],
+                "delta": r[2],
+                "reasonRu": r[3],
+                "source": r[4],
+                "createdAt": r[5].isoformat() if r[5] else None
+            })
+        return {"ok": True, "value": out, "Count": len(out)}
+@app.get("/thought_templates/{parameter_key}")
+def get_thought_templates(parameter_key: str) -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            "SELECT ParameterKey, CharacterKey, BinMin, BinMax, TextRu, TrendUpTextRu, TrendDownTextRu, UpdatedAt "
+            "FROM dbo.ParameterThoughtTemplates WHERE ParameterKey=? "
+            "ORDER BY CharacterKey, BinMin",
+            parameter_key
+        )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "parameter_key": r[0],
+                "character_key": r[1],
+                "bin_min": int(r[2]),
+                "bin_max": int(r[3]),
+                "text_ru": r[4],
+                "trend_up_text_ru": r[5],
+                "trend_down_text_ru": r[6],
+                "updated_at": r[7].isoformat() if r[7] else None
+            })
+        return {"ok": True, "value": out, "Count": len(out)}
+@app.post("/thought_templates/{parameter_key}/upsert")
+def upsert_thought_template(parameter_key: str, payload: ThoughtTemplateUpsertIn) -> Dict[str, Any]:
+    ch_key = payload.character_key or DEFAULT_CHARKEY
+    if ch_key.strip() == "":
+        ch_key = DEFAULT_CHARKEY
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            "MERGE dbo.ParameterThoughtTemplates AS tgt "
+            "USING (SELECT ? AS ParameterKey, ? AS CharacterKey, ? AS BinMin, ? AS BinMax) AS src "
+            "ON (tgt.ParameterKey=src.ParameterKey AND tgt.CharacterKey=src.CharacterKey AND tgt.BinMin=src.BinMin AND tgt.BinMax=src.BinMax) "
+            "WHEN MATCHED THEN UPDATE SET TextRu=?, TrendUpTextRu=?, TrendDownTextRu=?, UpdatedAt=sysdatetime() "
+            "WHEN NOT MATCHED THEN INSERT(ParameterKey,CharacterKey,BinMin,BinMax,TextRu,TrendUpTextRu,TrendDownTextRu,UpdatedAt) "
+            "VALUES(?,?,?,?,?,?,?,sysdatetime());",
+            parameter_key, ch_key, int(payload.bin_min), int(payload.bin_max),
+            payload.text_ru, payload.trend_up_text_ru, payload.trend_down_text_ru,
+            parameter_key, ch_key, int(payload.bin_min), int(payload.bin_max),
+            payload.text_ru, payload.trend_up_text_ru, payload.trend_down_text_ru
+        )
+        cn.commit()
+    return {"ok": True}
+# ---- Patch 002: Events + Autotune ----
+@app.post("/events")
+def create_event(payload: EventIn) -> Dict[str, Any]:
+    if not payload.character_key:
+        raise HTTPException(status_code=400, detail="character_key required")
+    # pack payload json
+    packed = payload.payload or {}
+    if payload.text is not None:
+        packed["text"] = payload.text
+    packed["platform"] = payload.platform
+    packed["channel"] = payload.channel
+    packed["event_type"] = payload.event_type
+    packed["conversation_key"] = payload.conversation_key
+    packed["lang"] = payload.lang
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        # validate character exists
+        _ = _get_character_id(cur, payload.character_key)
+        cur.execute(
+            "INSERT INTO dbo.InteractionEvents(Platform, Channel, ConversationKey, CharacterKey, EventType, PayloadJson, Lang, Sentiment, EngagementScore, AdminScore) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            payload.platform, payload.channel, payload.conversation_key, payload.character_key,
+            payload.event_type, json.dumps(packed, ensure_ascii=False), payload.lang,
+            payload.sentiment, payload.engagement, payload.admin_score
+        )
+        cur.execute("SELECT SCOPE_IDENTITY()")
+        eid = int(cur.fetchone()[0])
+        cn.commit()
+    return {"ok": True, "event_id": eid}
+@app.get("/events/unprocessed")
+def list_unprocessed_events(limit: int = 50, character_key: Optional[str] = None) -> Dict[str, Any]:
+    lim = int(limit)
+    if lim < 1: lim = 1
+    if lim > 500: lim = 500
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        if character_key:
+            cur.execute(
+                "SELECT TOP (?) Id, CreatedAt, Platform, Channel, ConversationKey, CharacterKey, EventType, Lang, Sentiment, EngagementScore, AdminScore "
+                "FROM dbo.InteractionEvents WHERE Processed=0 AND CharacterKey=? ORDER BY CreatedAt ASC, Id ASC",
+                lim, character_key
+            )
+        else:
+            cur.execute(
+                "SELECT TOP (?) Id, CreatedAt, Platform, Channel, ConversationKey, CharacterKey, EventType, Lang, Sentiment, EngagementScore, AdminScore "
+                "FROM dbo.InteractionEvents WHERE Processed=0 ORDER BY CreatedAt ASC, Id ASC",
+                lim
+            )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r[0]),
+                "createdAt": r[1].isoformat() if r[1] else None,
+                "platform": r[2],
+                "channel": r[3],
+                "conversation_key": r[4],
+                "character_key": r[5],
+                "event_type": r[6],
+                "lang": r[7],
+                "sentiment": float(r[8]) if r[8] is not None else None,
+                "engagement": float(r[9]) if r[9] is not None else None,
+                "admin_score": int(r[10]) if r[10] is not None else None
+            })
+        return {"ok": True, "value": out, "Count": len(out)}
+@app.post("/events/process")
+def process_events_endpoint(
+    limit: int = 100,
+    dry_run: bool = False,
+    character_key: Optional[str] = None
+) -> ProcessResult:
+    try:
+        p, a = process_events(limit=int(limit), dry_run=bool(dry_run), character_key=character_key)
+        return ProcessResult(ok=True, processed_events=p, applied_changes=a, dry_run=bool(dry_run))
+    except Exception as e:
+        logger.exception("events/process failed: %s", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/autotune/policy")
+def get_autotune_policy(prefix: str = "") -> Dict[str, Any]:
+    with get_cnx(autocommit=True) as cn:
+        cur = cn.cursor()
+        if prefix:
+            cur.execute(
+                "SELECT ParameterKey, Enabled, MinAllowed, MaxAllowed, LearnRate, COALESCE(SignalsJson,N'{}'), UpdatedAt "
+                "FROM dbo.ParameterAutoTunePolicy WHERE ParameterKey LIKE ? ORDER BY ParameterKey",
+                prefix + "%"
+            )
+        else:
+            cur.execute(
+                "SELECT ParameterKey, Enabled, MinAllowed, MaxAllowed, LearnRate, COALESCE(SignalsJson,N'{}'), UpdatedAt "
+                "FROM dbo.ParameterAutoTunePolicy ORDER BY ParameterKey"
+            )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "parameter_key": r[0],
+                "enabled": bool(r[1]),
+                "min_allowed": int(r[2]),
+                "max_allowed": int(r[3]),
+                "learn_rate": float(r[4]),
+                "signals": _parse_json_safe(r[5]) or {},
+                "updated_at": r[6].isoformat() if r[6] else None
+            })
+        return {"ok": True, "value": out, "Count": len(out)}
+class PolicySetIn(BaseModel):
+    parameter_key: str
+    enabled: Optional[bool] = None
+    min_allowed: Optional[int] = None
+    max_allowed: Optional[int] = None
+    learn_rate: Optional[float] = None
+    signals: Optional[Dict[str, Any]] = None
+@app.post("/autotune/policy/set")
+def set_autotune_policy(payload: PolicySetIn) -> Dict[str, Any]:
+    if not payload.parameter_key:
+        raise HTTPException(status_code=400, detail="parameter_key required")
+    with get_cnx(autocommit=False) as cn:
+        cur = cn.cursor()
+        enabled, min_a, max_a, lr, sig = _get_policy(cur, payload.parameter_key)
+        if payload.enabled is not None:
+            enabled = bool(payload.enabled)
+        if payload.min_allowed is not None:
+            min_a = int(payload.min_allowed)
+        if payload.max_allowed is not None:
+            max_a = int(payload.max_allowed)
+        if payload.learn_rate is not None:
+            lr = float(payload.learn_rate)
+        if payload.signals is not None:
+            sig = payload.signals
+        cur.execute(
+            "MERGE dbo.ParameterAutoTunePolicy AS tgt "
+            "USING (SELECT ? AS ParameterKey) AS src "
+            "ON (tgt.ParameterKey=src.ParameterKey) "
+            "WHEN MATCHED THEN UPDATE SET Enabled=?, MinAllowed=?, MaxAllowed=?, LearnRate=?, SignalsJson=?, UpdatedAt=sysdatetime() "
+            "WHEN NOT MATCHED THEN INSERT(ParameterKey,Enabled,MinAllowed,MaxAllowed,LearnRate,SignalsJson,UpdatedAt) "
+            "VALUES(?,?,?,?,?,?,sysdatetime());",
+            payload.parameter_key,
+            1 if enabled else 0, int(min_a), int(max_a), float(lr), json.dumps(sig, ensure_ascii=False),
+            payload.parameter_key,
+            1 if enabled else 0, int(min_a), int(max_a), float(lr), json.dumps(sig, ensure_ascii=False)
+        )
+        cn.commit()
+    return {"ok": True}
+def _autotune_loop() -> None:
+    # small delay to allow service startup
+    time.sleep(2.0)
+    while True:
+        try:
+            p, a = process_events(limit=AUTOTUNE_MAX_EVENTS, dry_run=False)
+            if p > 0:
+                _log_autotune_run(p, a, dry_run=False, notes="background")
+                logger.info("Autotune background: processed=%s applied=%s", p, a)
+        except Exception as e:
+            logger.exception("Autotune background error: %s", str(e))
+        time.sleep(max(5, AUTOTUNE_INTERVAL_SEC))
+@app.on_event("startup")
+def _on_startup() -> None:
+    if AUTOTUNE_BACKGROUND:
+        t = threading.Thread(target=_autotune_loop, name="autotune-loop", daemon=True)
+        t.start()
+        logger.info("Autotune background worker started (interval=%ss, max_events=%s).", AUTOTUNE_INTERVAL_SEC, AUTOTUNE_MAX_EVENTS)
+    else:
+        logger.info("Autotune background worker disabled (AUTOTUNE_BACKGROUND=0).")

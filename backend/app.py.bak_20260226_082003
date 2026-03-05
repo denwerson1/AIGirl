@@ -1,0 +1,60 @@
+﻿import os
+from dotenv import load_dotenv
+from fastapi import FastAPI
+import pyodbc
+
+load_dotenv()
+
+app = FastAPI(title="AIGirl Backend (local)")
+
+def get_cnx():
+    # ODBC 17; шифрование выключаем (локальная Express без сертификата)
+    server = os.getenv("DB_SERVER")
+    db = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    pwd = os.getenv("DB_PASSWORD")
+    cs = (
+        "Driver={ODBC Driver 17 for SQL Server};"
+        f"Server={server};Database={db};"
+        f"UID={user};PWD={pwd};"
+        "Encrypt=no;TrustServerCertificate=yes;"
+    )
+    return pyodbc.connect(cs, timeout=5)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/settings")
+def settings():
+    cn = get_cnx()
+    try:
+        cur = cn.cursor()
+        rows = cur.execute("SELECT [Key],[Value] FROM dbo.Settings").fetchall()
+        return {r[0]: r[1] for r in rows}
+    finally:
+        cn.close()
+
+@app.get("/parameters")
+def parameters():
+    cn = get_cnx()
+    try:
+        cur = cn.cursor()
+        rows = cur.execute(
+            "SELECT [Key],NameRu,GroupRu,MinValue,MaxValue,DefaultValue,HintRu "
+            "FROM dbo.ParameterDefinitions ORDER BY GroupRu, NameRu"
+        ).fetchall()
+        return [
+            {
+                "key": r[0],
+                "nameRu": r[1],
+                "groupRu": r[2],
+                "min": int(r[3]),
+                "max": int(r[4]),
+                "default": int(r[5]),
+                "hintRu": r[6],
+            }
+            for r in rows
+        ]
+    finally:
+        cn.close()
