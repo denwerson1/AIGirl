@@ -1,0 +1,25 @@
+﻿# --- Secrets / local config ---
+**/.env
+**/.env.*
+*.env
+*.bak_*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/venv/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- .NET ---
+.vs/
+**/bin/
+**/obj/
+
+# --- OS ---
+Thumbs.db
+.DS_Store
